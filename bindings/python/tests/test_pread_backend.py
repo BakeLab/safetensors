@@ -337,10 +337,14 @@ class PrefetchCudaTests(unittest.TestCase):
                 f.prefetch({"fp32_2d": slice(0, 3, 0)}, device="cuda:0")
             with self.assertRaisesRegex(Exception, "selects no tensors"):
                 f.prefetch({}, device="cuda:0")
-            with self.assertRaises(
-                OverflowError
-            ):  # negative bounds: not taken by get_slice either
-                f.prefetch({"fp32_2d": slice(-3, 3)}, device="cuda:0")
+            # a start past the end, or before the start once counted from the end, misses the tensor
+            with self.assertRaisesRegex(Exception, "out of bounds"):
+                f.prefetch({"fp32_2d": slice(4, None)}, device="cuda:0")
+            with self.assertRaisesRegex(Exception, "Invalid slice start"):
+                f.prefetch({"fp32_2d": slice(-4, None)}, device="cuda:0")
+            # negative bounds count from the end, as in python
+            with f.prefetch({"fp32_2d": slice(-3, 3)}, device="cuda:0") as loader:
+                self.assertEqual(tuple(loader.take("fp32_2d").shape), (3, 4))
 
     def test_delivered_allocations_are_released_before_close(self):
         # a loader kept open must not pin shards whose tensors were all handed out and dropped:
@@ -373,7 +377,7 @@ class PrefetchCudaTests(unittest.TestCase):
             used, 300 * mib, f"{used / mib:.0f} MiB resident with both loaders open"
         )
 
-    def test_plan_regions_match_source(self):
+    def test_plan_slices_match_source(self):
         # a plan entry means what indexing `get_slice` means, plus lists per dimension; the result is contiguous
         plan = {
             "fp32_2d": (slice(None), slice(0, 4, 2)),  # every other column
@@ -402,7 +406,42 @@ class PrefetchCudaTests(unittest.TestCase):
             self.assertEqual(tuple(got[name].shape), tuple(want.shape), name)
             self.assertTrue(torch.equal(got[name].cpu(), want), name)
 
-    def test_plan_rejects_bad_regions(self):
+    def test_plan_steps_and_int_lists(self):
+        # a step along the rows is one pitched copy; an int in a list keeps its dimension, as in numpy
+        plan = {
+            "fp32_2d": (slice(0, 3, 2), slice(1, 4)),
+            "fp16_3d": ([1], slice(None), slice(1, 3)),
+        }
+        with self._open(plan=plan) as loader:
+            got = {name: loader.take(name) for name in plan}
+        src = SOURCE_TENSORS
+        expected = {
+            "fp32_2d": src["fp32_2d"][0:3:2, 1:4],
+            "fp16_3d": src["fp16_3d"][1:2, :, 1:3],
+        }
+        for name, want in expected.items():
+            self.assertEqual(tuple(got[name].shape), tuple(want.shape), name)
+            self.assertTrue(torch.equal(got[name].cpu(), want), name)
+
+    def test_slices_across_chunks(self):
+        # chunks are 16 MiB: in a 64 MiB tensor, a column slice is cut by chunk edges mid-row, and a row list
+        # with a 48 MiB gap between its parts leaves the gap unread
+        path = os.path.join(self.tempdir.name, "big.safetensors")
+        w = torch.arange(2048 * 8192, dtype=torch.float32).reshape(2048, 8192)
+        save_file({"w": w}, path)
+        with safe_open(path, framework="pt") as f:
+            with f.prefetch(
+                {"w": (slice(None), slice(100, 1124))}, device="cuda:0"
+            ) as loader:
+                cols = loader.take("w")
+            with f.prefetch(
+                {"w": ([slice(0, 256), slice(1792, 2048)],)}, device="cuda:0"
+            ) as loader:
+                rows = loader.take("w")
+        self.assertTrue(torch.equal(cols.cpu(), w[:, 100:1124]))
+        self.assertTrue(torch.equal(rows.cpu(), torch.cat([w[0:256], w[1792:2048]])))
+
+    def test_plan_rejects_bad_slices(self):
         with safe_open(self.path, framework="pt") as f:
             with self.assertRaisesRegex(
                 Exception, "more slicing indexes than dimensions"
@@ -520,7 +559,7 @@ class PrefetchCudaTests(unittest.TestCase):
         self.assertEqual(x.dtype, torch.float4_e2m1fn_x2)
         self.assertEqual(tuple(x.shape), (2, 4))
         self.assertEqual(x.view(torch.uint8).cpu().flatten().tolist(), list(raw[4:12]))
-        # two F4 elements per byte: a column region must cut on whole bytes
+        # two F4 elements per byte: a column slice must cut on whole bytes
         with safe_open(path, framework="pt") as f:
             with f.prefetch(
                 {"x": (slice(None), slice(2, 6))}, device="cuda:0"

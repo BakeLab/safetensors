@@ -301,12 +301,57 @@ fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String
     Ok(items)
 }
 
-/// Parses a Python index (`int`, `slice`, `...`, or a tuple of those) into
-/// byte-range [`TensorIndexer`]s. The slice step is carried in
-/// [`TensorIndexer::Narrow`]; step <= 0 is rejected.
-fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<TensorIndexer>> {
-    let py = slices.py();
+/// Parses one Python index, an `int` or a `slice`, along dimension `dim_idx` of size `dim`. Negative
+/// values count from the end, as in python; a step <= 0 is rejected.
+fn parse_index(it: &PyBound<'_, PyAny>, dim_idx: usize, dim: usize) -> PyResult<TensorIndexer> {
+    let from_end = |v: isize, what: &str| -> PyResult<usize> {
+        if v < 0 {
+            dim.checked_add_signed(v).ok_or_else(|| {
+                SafetensorError::new_err(format!(
+                    "Invalid {what} {v} for dimension {dim_idx} of size {dim}"
+                ))
+            })
+        } else {
+            Ok(v as usize)
+        }
+    };
+    if let Ok(slice) = it.cast::<PySlice>() {
+        let py = it.py();
+        let start: Option<isize> = slice.getattr(intern!(py, "start"))?.extract()?;
+        let stop: Option<isize> = slice.getattr(intern!(py, "stop"))?.extract()?;
+        let step_raw: i64 = slice
+            .getattr(intern!(py, "step"))?
+            .extract::<Option<i64>>()?
+            .unwrap_or(1);
+        let step = usize::try_from(step_raw)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| {
+                SafetensorError::new_err(format!(
+                    "Slice step must be a positive integer, got {step_raw}"
+                ))
+            })?;
+        let start = match start {
+            Some(s) => Bound::Included(from_end(s, "slice start")?),
+            None => Bound::Unbounded,
+        };
+        let stop = match stop {
+            Some(s) => Bound::Excluded(from_end(s, "slice stop")?),
+            None => Bound::Unbounded,
+        };
+        Ok(TensorIndexer::Narrow(start, stop, step))
+    } else if let Ok(idx) = it.extract::<isize>() {
+        Ok(TensorIndexer::Select(from_end(idx, "index")?))
+    } else {
+        Err(SafetensorError::new_err(format!(
+            "Unsupported slice index at position {dim_idx}: expected slice, int, or ellipsis"
+        )))
+    }
+}
 
+/// Parses a Python index (`int`, `slice`, `...`, or a tuple of those) into one
+/// [`TensorIndexer`] per leading dimension of `shape`.
+fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<TensorIndexer>> {
     let items: Vec<PyBound<'_, PyAny>> = if let Ok(tup) = slices.cast::<PyTuple>() {
         tup.iter().collect()
     } else if let Ok(lst) = slices.cast::<PyList>() {
@@ -334,66 +379,19 @@ fn parse_indexers(slices: &PyBound<'_, PyAny>, shape: &[usize]) -> PyResult<Vec<
             "Only one ellipsis (...) is allowed in slice index",
         ));
     }
-    let n_explicit = items.len() - ellipsis_count;
-    let n_expansion = shape.len().saturating_sub(n_explicit);
+    let n_expansion = shape.len().saturating_sub(items.len() - ellipsis_count);
 
     let mut indexers: Vec<TensorIndexer> = Vec::with_capacity(shape.len());
-    let mut dim_idx = 0usize;
     for it in items {
         if it.is_instance_of::<PyEllipsis>() {
-            for _ in 0..n_expansion {
-                indexers.push(TensorIndexer::Narrow(
-                    Bound::Unbounded,
-                    Bound::Unbounded,
-                    NonZeroUsize::MIN,
-                ));
-                dim_idx += 1;
-            }
-        } else if let Ok(slice) = it.cast::<PySlice>() {
-            let start: Option<usize> = slice.getattr(intern!(py, "start"))?.extract()?;
-            let stop: Option<usize> = slice.getattr(intern!(py, "stop"))?.extract()?;
-            let step_raw: i64 = slice
-                .getattr(intern!(py, "step"))?
-                .extract::<Option<i64>>()?
-                .unwrap_or(1);
-            let step = usize::try_from(step_raw)
-                .ok()
-                .and_then(NonZeroUsize::new)
-                .ok_or_else(|| {
-                    SafetensorError::new_err(format!(
-                        "Slice step must be a positive integer, got {step_raw}"
-                    ))
-                })?;
-            let start_b = match start {
-                Some(s) => Bound::Included(s),
-                None => Bound::Unbounded,
-            };
-            let stop_b = match stop {
-                Some(s) => Bound::Excluded(s),
-                None => Bound::Unbounded,
-            };
-            indexers.push(TensorIndexer::Narrow(start_b, stop_b, step));
-            dim_idx += 1;
-        } else if let Ok(idx) = it.extract::<i32>() {
-            let dim = shape.get(dim_idx).copied().unwrap_or(0);
-            let resolved = if idx < 0 {
-                dim.checked_add_signed(idx as isize).ok_or_else(|| {
-                    SafetensorError::new_err(format!(
-                        "Invalid index {idx} for dimension {dim_idx} of size {dim}"
-                    ))
-                })?
-            } else {
-                idx as usize
-            };
-            indexers.push(TensorIndexer::Select(resolved));
-            dim_idx += 1;
+            indexers.extend((0..n_expansion).map(|_| {
+                TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded, NonZeroUsize::MIN)
+            }));
         } else {
-            return Err(SafetensorError::new_err(format!(
-                "Unsupported slice index at position {dim_idx}: expected slice, int, or ellipsis"
-            )));
+            let d = indexers.len();
+            indexers.push(parse_index(&it, d, shape.get(d).copied().unwrap_or(0))?);
         }
     }
-
     Ok(indexers)
 }
 
@@ -662,8 +660,8 @@ struct SpanMeta {
 
 /// The tensors of one file loading to a CUDA device in the background, see
 /// [`safe_open::prefetch`]. Each tensor is handed out once, by [`Self::take`] or
-/// by iterating. Tensors never taken hold their device memory until the loader
-/// is closed.
+/// by iterating. A tensor never taken holds its whole allocation, taken
+/// neighbours included, until the loader is closed.
 ///
 /// Tensors are ready on any stream when handed out. A tensor used on a stream
 /// other than the one current when it was handed out must have that stream
@@ -717,7 +715,7 @@ impl PrefetchLoader {
     }
 
     /// `(name, tensor)` pairs as they finish loading, so the order is
-    /// unspecified; tensors already taken are skipped.
+    /// unspecified.
     fn __iter__(slf: PyRef<'_, Self>) -> TensorStream {
         let iter = slf.loader.iter();
         let entries = slf.spans.clone();
@@ -977,9 +975,15 @@ impl Open {
                 )))
             }
         };
-        let regions = match plan {
-            Some(plan) => Some(self.parse_plan(plan)?),
-            None => None,
+        let slices = match plan {
+            Some(plan) => self.parse_plan(plan)?,
+            // no plan: every tensor, whole
+            None => self
+                .metadata
+                .offset_keys()
+                .into_iter()
+                .map(|name| (name, vec![]))
+                .collect(),
         };
 
         let mut spans = Vec::new();
@@ -987,14 +991,9 @@ impl Open {
         let mut metas = Vec::new();
         let mut index_map = HashMap::new();
         for name in self.metadata.offset_keys() {
-            let indexers = match &regions {
-                None => None,
-                Some(regions) => match regions.get(&name) {
-                    None => continue,
-                    Some(indexers) => indexers.as_deref(),
-                },
+            let Some(indexers) = slices.get(&name) else {
+                continue;
             };
-
             let info = self.metadata.info(&name).ok_or_else(|| {
                 SafetensorError::new_err(format!("File does not contain tensor {name}"))
             })?;
@@ -1008,33 +1007,23 @@ impl Open {
                 )));
             }
 
-            let (start, end) = info.data_offsets;
-            let (span, shape, gather) = match indexers {
-                None => (Span { start, end }, info.shape.clone(), None),
-                Some(indexers) => {
-                    let region =
-                        safetensors::slice::slice_region(info.dtype, &info.shape, indexers)
-                            .map_err(|e| {
-                                SafetensorError::new_err(format!("cannot plan {name}: {e}"))
-                            })?;
-                    let span = Span {
-                        start: start + region.read.start,
-                        end: start + region.read.end,
-                    };
-                    (span, region.shape, region.gather)
-                }
-            };
+            let layout = safetensors::slice::slice_layout(info.dtype, &info.shape, indexers)
+                .map_err(|e| SafetensorError::new_err(format!("cannot plan {name}: {e}")))?;
+            let start = info.data_offsets.0;
             index_map.insert(name.clone(), spans.len());
-            spans.push(span);
-            gathers.push(gather);
+            spans.push(Span {
+                start: start + layout.read.start,
+                end: start + layout.read.end,
+            });
+            gathers.push(layout.gather);
             metas.push(SpanMeta {
                 name,
                 dtype: info.dtype,
-                shape,
+                shape: layout.shape,
             });
         }
 
-        if regions.is_some() && spans.is_empty() {
+        if plan.is_some() && spans.is_empty() {
             return Err(SafetensorError::new_err("prefetch plan selects no tensors"));
         }
         let loader = Loader::load(
@@ -1052,13 +1041,12 @@ impl Open {
         })
     }
 
-    /// Validates a prefetch plan into `name -> indexers` (one list per leading dimension), `None` meaning the
-    /// whole tensor.
+    /// Parses a prefetch plan into `name -> indexers`, one list per leading dimension; a whole tensor has none.
     fn parse_plan(
         &self,
         plan: &PyBound<'_, PyDict>,
-    ) -> PyResult<HashMap<String, Option<Vec<Vec<TensorIndexer>>>>> {
-        let mut regions = HashMap::with_capacity(plan.len());
+    ) -> PyResult<HashMap<String, Vec<Vec<TensorIndexer>>>> {
+        let mut slices = HashMap::with_capacity(plan.len());
         for (key, value) in plan.iter() {
             let name: String = key
                 .extract()
@@ -1067,18 +1055,27 @@ impl Open {
                 SafetensorError::new_err(format!("File does not contain tensor {name}"))
             })?;
             if value.is_none() {
-                regions.insert(name, None);
+                slices.insert(name, vec![]);
                 continue;
             }
-            let one = |dim: usize, it: &PyBound<'_, PyAny>| -> PyResult<TensorIndexer> {
-                if it.is_instance_of::<PyEllipsis>() {
-                    return Err(SafetensorError::new_err(format!(
-                        "cannot plan {name}: `...` cannot be combined with lists"
-                    )));
-                }
-                Ok(parse_indexers(it, &info.shape[dim..=dim])?.remove(0))
-            };
-            let region = match value.cast::<PyTuple>() {
+            let one =
+                |dim: usize, it: &PyBound<'_, PyAny>, in_list: bool| -> PyResult<TensorIndexer> {
+                    if it.is_instance_of::<PyEllipsis>() {
+                        return Err(SafetensorError::new_err(format!(
+                            "cannot plan {name}: `...` cannot be combined with lists"
+                        )));
+                    }
+                    // an int in a list keeps its dimension, as in numpy; only a bare int drops it
+                    Ok(match parse_index(it, dim, info.shape[dim])? {
+                        TensorIndexer::Select(s) if in_list => TensorIndexer::Narrow(
+                            Bound::Included(s),
+                            Bound::Excluded(s + 1),
+                            NonZeroUsize::MIN,
+                        ),
+                        ix => ix,
+                    })
+                };
+            let slice = match value.cast::<PyTuple>() {
                 Ok(tuple) if tuple.iter().any(|it| it.is_instance_of::<PyList>()) => {
                     if tuple.len() > info.shape.len() {
                         return Err(SafetensorError::new_err(format!(
@@ -1090,8 +1087,8 @@ impl Open {
                         .iter()
                         .enumerate()
                         .map(|(dim, item)| match item.cast::<PyList>() {
-                            Ok(list) => list.iter().map(|it| one(dim, &it)).collect(),
-                            Err(_) => Ok(vec![one(dim, &item)?]),
+                            Ok(list) => list.iter().map(|it| one(dim, &it, true)).collect(),
+                            Err(_) => Ok(vec![one(dim, &item, false)?]),
                         })
                         .collect::<PyResult<Vec<_>>>()?
                 }
@@ -1101,9 +1098,9 @@ impl Open {
                     .map(|ix| vec![ix])
                     .collect(),
             };
-            regions.insert(name, Some(region));
+            slices.insert(name, slice);
         }
-        Ok(regions)
+        Ok(slices)
     }
 
     /// Returns a full tensor
@@ -1725,7 +1722,9 @@ impl safe_open {
     /// [`PrefetchLoader::take`] or by iterating it as `(name, tensor)` pairs.
     /// The handle itself is unchanged: its header queries and [`Self::get_slice`]
     /// keep working, and several loaders can be started from one handle (for
-    /// instance one per device). Requires `framework="pt"`.
+    /// instance one per device).
+    ///
+    /// Requires `framework="pt"`.
     ///
     /// Args:
     ///     plan (`Dict[str, Optional[Any]]`, *optional*):
@@ -1734,7 +1733,8 @@ impl safe_open {
     ///         takes (an int, a slice, `...`, or a tuple of those). In a tuple, a
     ///         dimension's entry can also be a list of ints and slices, kept in
     ///         order along that dimension (e.g. the two halves of a fused
-    ///         projection). `None` (the default) loads every tensor whole.
+    ///         projection); an int in a list keeps its dimension, as in numpy.
+    ///         `None` (the default) loads every tensor whole.
     ///     device (`str` or `int`, *optional*):
     ///         The CUDA device to load to; defaults to the handle's `device`.
     ///     threads (`int`, defaults to 8):

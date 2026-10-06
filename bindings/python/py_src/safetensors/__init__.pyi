@@ -15,9 +15,7 @@
 import os
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-PrefetchPlan = Dict[
-    str, Optional[Any]
-]  # an index as `get_slice` takes it, see `safe_open.prefetch`
+PrefetchPlan = Dict[str, Optional[Any]]
 
 __version__: str
 
@@ -180,8 +178,8 @@ class PySafeSlice:
 class PrefetchLoader:
     """
     The tensors of one file loading to a CUDA device in the background, returned by
-    `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating. Tensors
-    never taken hold their device memory until `close`.
+    `safe_open.prefetch`. Each tensor is handed out once, by `take` or by iterating. A tensor
+    never taken holds its whole allocation, taken neighbours included, until `close`.
 
     Tensors are ready on any stream when handed out. A tensor used on a stream other than the one
     current when it was handed out must have that stream synchronized before its last reference is
@@ -200,7 +198,7 @@ class PrefetchLoader:
         """
         pass
     def __iter__(self) -> Iterator[Tuple[str, Any]]:
-        """`(name, tensor)` pairs as they finish loading (unspecified order); tensors already taken are skipped."""
+        """`(name, tensor)` pairs as they finish loading (unspecified order)"""
         pass
     def close(self) -> None:
         """Stops the background load and releases every tensor not taken yet; tensors already handed out keep their memory."""
@@ -255,7 +253,9 @@ class safe_open:
         Returns a `PrefetchLoader` that hands each tensor out once, by `take(name)` or by
         iterating it as `(name, tensor)` pairs. The handle itself is unchanged: its header
         queries and `get_slice` keep working, and several loaders can be started from one
-        handle (for instance one per device). Requires `framework="pt"`.
+        handle (for instance one per device).
+
+        Requires `framework="pt"`.
 
         Args:
             plan (`Dict[str, Optional[Any]]`, *optional*):
@@ -264,7 +264,8 @@ class safe_open:
                 takes (an int, a slice, `...`, or a tuple of those). In a tuple, a
                 dimension's entry can also be a list of ints and slices, kept in
                 order along that dimension (e.g. the two halves of a fused
-                projection). `None` (the default) loads every tensor whole.
+                projection); an int in a list keeps its dimension, as in numpy.
+                `None` (the default) loads every tensor whole.
             device (`str` or `int`, *optional*):
                 The CUDA device to load to; defaults to the handle's `device`.
             threads (`int`, defaults to 8):
