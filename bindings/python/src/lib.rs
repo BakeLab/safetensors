@@ -1308,20 +1308,13 @@ impl Open {
                         .getattr(intern!(py, "view"))?
                         .call((), Some(&view_kwargs))?;
 
-                    if byteorder == "big" {
+                    if byteorder == "big" && info.dtype.bitsize() > 8 {
                         let inplace_kwargs =
                             [(intern!(py, "inplace"), PyBool::new(py, false))].into_py_dict(py)?;
 
-                        let intermediary_dtype = match info.dtype {
-                            Dtype::BF16 => Some(Dtype::F16),
-                            Dtype::F8_E5M2 => Some(Dtype::U8),
-                            Dtype::F8_E4M3 => Some(Dtype::U8),
-                            Dtype::F8_E8M0 => Some(Dtype::U8),
-                            _ => None,
-                        };
-                        if let Some(intermediary_dtype) = intermediary_dtype {
+                        if info.dtype == Dtype::BF16 {
                             // Reinterpret to f16 for numpy compatibility.
-                            let dtype: Py<PyAny> = get_pydtype(torch, intermediary_dtype, false)?;
+                            let dtype: Py<PyAny> = get_pydtype(torch, Dtype::F16, false)?;
                             let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
                             tensor = tensor
                                 .getattr(intern!(py, "view"))?
@@ -1333,7 +1326,7 @@ impl Open {
                             .getattr("byteswap")?
                             .call((), Some(&inplace_kwargs))?;
                         tensor = torch.getattr(intern!(py, "from_numpy"))?.call1((numpy,))?;
-                        if intermediary_dtype.is_some() {
+                        if info.dtype == Dtype::BF16 {
                             // Reinterpret to f16 for numpy compatibility.
                             let dtype: Py<PyAny> = get_pydtype(torch, info.dtype, false)?;
                             let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
@@ -2160,22 +2153,15 @@ impl PySafeSlice {
                     .call((storage_slice,), Some(&kwargs))?
                     .getattr(intern!(py, "view"))?
                     .call((), Some(&view_kwargs))?;
-                if byteorder == "big" {
+                if byteorder == "big" && self.info.dtype.bitsize() > 8 {
                     // Important, do NOT use inplace otherwise the slice itself
                     // is byteswapped, meaning multiple calls will fails
                     let inplace_kwargs =
                         [(intern!(py, "inplace"), PyBool::new(py, false))].into_py_dict(py)?;
 
-                    let intermediary_dtype = match self.info.dtype {
-                        Dtype::BF16 => Some(Dtype::F16),
-                        Dtype::F8_E5M2 => Some(Dtype::U8),
-                        Dtype::F8_E4M3 => Some(Dtype::U8),
-                        Dtype::F8_E8M0 => Some(Dtype::U8),
-                        _ => None,
-                    };
-                    if let Some(intermediary_dtype) = intermediary_dtype {
+                    if self.info.dtype == Dtype::BF16 {
                         // Reinterpret to f16 for numpy compatibility.
-                        let dtype: Py<PyAny> = get_pydtype(torch, intermediary_dtype, false)?;
+                        let dtype: Py<PyAny> = get_pydtype(torch, Dtype::F16, false)?;
                         let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
                         tensor = tensor
                             .getattr(intern!(py, "view"))?
@@ -2187,7 +2173,7 @@ impl PySafeSlice {
                         .getattr("byteswap")?
                         .call((), Some(&inplace_kwargs))?;
                     tensor = torch.getattr(intern!(py, "from_numpy"))?.call1((numpy,))?;
-                    if intermediary_dtype.is_some() {
+                    if self.info.dtype == Dtype::BF16 {
                         // Reinterpret to f16 for numpy compatibility.
                         let dtype: Py<PyAny> = get_pydtype(torch, self.info.dtype, false)?;
                         let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
