@@ -18,6 +18,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: python-release-${{ github.event_name }}-${{ (github.event_name == 'pull_request') && (github.event.pull_request.number || github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   linux:
     runs-on: ${{ matrix.platform.runner }}
@@ -98,9 +102,7 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: macos-15-intel
-            target: x86_64
-          - runner: macos-14
+          - runner: macos-latest
             target: aarch64
         python_interpreter: ['3.14', '3.14t']
     steps:

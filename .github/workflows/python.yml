@@ -3,11 +3,16 @@ name: Python
 on:
   pull_request:
 
+concurrency:
+  group: python-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && (github.event.pull_request.number || github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
 jobs:
   build_and_test:
     name: Check everything builds & tests
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: ["ubuntu-latest"]
         # Test the minimum supported interpreter. Wheel releases cover
@@ -22,12 +27,6 @@ jobs:
               python: "3.14"
               numpy: numpy
               arch: "x64-freethreaded"
-          - os: macos-15-intel
-            version:
-              torch: torch
-              numpy: "numpy==1.26"
-              python: "3.14"
-              arch: "x64"
           - os: macos-latest
             version:
               torch: torch
@@ -94,10 +93,14 @@ jobs:
 
       - name: Install (jax, flax)
         if: runner.os != 'Windows'
-        # resolve jax together with the matrix numpy pin: ml_dtypes>=0.6 needs
-        # numpy 2 and would otherwise upgrade it under a numpy-1 torch
-        run:
-          pip install .[jax] ${{ matrix.version.numpy }}
+        run: |
+          # The locked Orbax version does not pull grpcio through its GCS extra.
+          # grpcio does not supply a free-threaded Linux wheel.
+          if [[ "${{ matrix.version.arch }}" == x64-freethreaded ]]; then
+            pip install ".[jax]" "${{ matrix.version.numpy }}" "orbax-checkpoint==0.11.39"
+          else
+            pip install ".[jax]" "${{ matrix.version.numpy }}"
+          fi
         shell: bash
 
       - name: Install (mlx)
